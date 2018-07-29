@@ -81,7 +81,7 @@ keep_cache_t keep_cache;
 CellTypes ct_reg, ct_all;
 int count_rm_cells, count_rm_wires;
 
-void rmunused_module_cells(Module *module, bool verbose)
+void rmunused_module_cells(Module *module, bool one_driver, bool verbose)
 {
 	SigMap sigmap(module);
 	pool<Cell*> queue, unused;
@@ -95,9 +95,12 @@ void rmunused_module_cells(Module *module, bool verbose)
 					if (raw_bit.wire == nullptr)
 						continue;
 					auto bit = sigmap(raw_bit);
-					if (bit.wire == nullptr)
-						log_warning("Driver-driver conflict for %s between cell %s.%s and constant %s in %s: Resolved using constant.\n",
-								log_signal(raw_bit), log_id(cell), log_id(it2.first), log_signal(bit), log_id(module));
+					if (bit.wire == nullptr) {
+						if (!one_driver) {
+							log_warning("Driver-driver conflict for %s between cell %s.%s and constant %s in %s: Resolved using constant.\n",
+									log_signal(raw_bit), log_id(cell), log_id(it2.first), log_signal(bit), log_id(module));
+						}
+					}
 					if (bit.wire != nullptr)
 						wire2driver[bit].insert(cell);
 				}
@@ -409,7 +412,7 @@ bool rmunused_module_init(RTLIL::Module *module, bool purge_mode, bool verbose)
 	return did_something;
 }
 
-void rmunused_module(RTLIL::Module *module, bool purge_mode, bool verbose, bool rminit)
+void rmunused_module(RTLIL::Module *module, bool purge_mode, bool one_driver, bool verbose, bool rminit)
 {
 	if (verbose)
 		log("Finding unused cells or wires in module %s..\n", module->name.c_str());
@@ -433,7 +436,7 @@ void rmunused_module(RTLIL::Module *module, bool purge_mode, bool verbose, bool 
 	if (!delcells.empty())
 		module->design->scratchpad_set_bool("opt.did_something", true);
 
-	rmunused_module_cells(module, verbose);
+	rmunused_module_cells(module, one_driver, verbose);
 	rmunused_module_signals(module, purge_mode, verbose);
 
 	if (rminit && rmunused_module_init(module, purge_mode, verbose))
@@ -458,10 +461,15 @@ struct OptCleanPass : public Pass {
 		log("    -purge\n");
 		log("        also remove internal nets if they have a public name\n");
 		log("\n");
+		log("    -onedriver\n");
+		log("        if a net is driven by a constant as well as a cell output, emit an error\n");
+		log("        instead of removing the non-constant driver\n");
+		log("\n");
 	}
 	virtual void execute(std::vector<std::string> args, RTLIL::Design *design)
 	{
 		bool purge_mode = false;
+		bool one_driver = false;
 
 		log_header(design, "Executing OPT_CLEAN pass (remove unused cells and wires).\n");
 		log_push();
@@ -470,6 +478,10 @@ struct OptCleanPass : public Pass {
 		for (argidx = 1; argidx < args.size(); argidx++) {
 			if (args[argidx] == "-purge") {
 				purge_mode = true;
+				continue;
+			}
+			if (args[argidx] == "-onedriver") {
+				one_driver = true;
 				continue;
 			}
 			break;
@@ -486,7 +498,7 @@ struct OptCleanPass : public Pass {
 		for (auto module : design->selected_whole_modules_warn()) {
 			if (module->has_processes_warn())
 				continue;
-			rmunused_module(module, purge_mode, true, true);
+			rmunused_module(module, purge_mode, one_driver, true, true);
 		}
 
 		if (count_rm_cells > 0 || count_rm_wires > 0)
@@ -523,11 +535,16 @@ struct CleanPass : public Pass {
 	virtual void execute(std::vector<std::string> args, RTLIL::Design *design)
 	{
 		bool purge_mode = false;
+		bool one_driver = false;
 
 		size_t argidx;
 		for (argidx = 1; argidx < args.size(); argidx++) {
 			if (args[argidx] == "-purge") {
 				purge_mode = true;
+				continue;
+			}
+			if (args[argidx] == "-onedriver") {
+				one_driver = true;
 				continue;
 			}
 			break;
@@ -548,7 +565,7 @@ struct CleanPass : public Pass {
 		for (auto module : design->selected_whole_modules()) {
 			if (module->has_processes())
 				continue;
-			rmunused_module(module, purge_mode, false, false);
+			rmunused_module(module, purge_mode, one_driver, false, false);
 		}
 
 		if (count_rm_cells > 0 || count_rm_wires > 0)
