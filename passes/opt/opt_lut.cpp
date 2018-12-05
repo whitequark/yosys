@@ -21,6 +21,10 @@
 #include "kernel/sigtools.h"
 #include "kernel/modtools.h"
 
+#include <vector>
+#include <queue>
+#include <deque>
+
 USING_YOSYS_NAMESPACE
 PRIVATE_NAMESPACE_BEGIN
 
@@ -35,6 +39,7 @@ struct OptLutWorker
 	dict<RTLIL::Cell*, int> luts_arity;
 	dict<RTLIL::Cell*, pool<RTLIL::Cell*>> luts_dlogics;
 	dict<RTLIL::Cell*, pool<int>> luts_dlogic_inputs;
+	dict<RTLIL::SigBit, pool<Cell*>> sigbit_lut_inputs;
 
 	int combined_count = 0;
 
@@ -183,16 +188,74 @@ struct OptLutWorker
 				luts_arity[cell] = lut_arity;
 				luts_dlogics[cell] = lut_legal_dlogics;
 				luts_dlogic_inputs[cell] = lut_dlogic_inputs;
+				for (auto bit : sigmap(lut_input)) {
+					sigbit_lut_inputs[bit].insert(cell);
+				}
 			}
 		}
 		show_stats_by_arity();
 
 		log("\n");
+		log("Sorting LUTs according to topological ordering.\n");
+		std::queue<RTLIL::SigBit> visit;
+		pool<RTLIL::SigBit> added_to_visit;
+		// Add outputs of non-LUT cells to the visit queue
+		for (auto cell : module->cells()) {
+			if (luts.count(cell))
+				continue;
+			for (auto &conn : cell->connections()) {
+				if (cell->output(conn.first)) {
+					for (auto bit : sigmap(conn.second)) {
+						if (!added_to_visit.count(bit)) {
+							visit.push(bit);
+							added_to_visit.insert(bit);
+						}
+					}
+				}
+			}
+		}
+		// Add primary inputs to the visit queue
+		for (auto wire : module->wires()) {
+			if (wire->port_input) {
+				for (int i = 0; i < GetSize(wire); i++) {
+					auto bit = sigmap(SigBit(wire, i));
+					if (!added_to_visit.count(bit)) {
+						visit.push(bit);
+						added_to_visit.insert(bit);
+					}
+				}
+			}
+		}
+
+		pool<RTLIL::Cell*> available_luts;
+		std::deque<RTLIL::Cell*> topological_order;
+		while(visit.size()) {
+			SigBit visit_bit = visit.front();
+			visit.pop();
+			for (auto lut : sigbit_lut_inputs[visit_bit]) {
+				if (available_luts.count(lut))
+					continue;
+				available_luts.insert(lut);
+				topological_order.push_back(lut);
+				SigBit lut_output = sigmap(lut->getPort("\\Y")[0]);
+				if (!added_to_visit.count(lut_output)) {
+					visit.push(lut_output);
+					added_to_visit.insert(lut_output);
+				}
+			}
+		}
+
+		log("\n");
 		log("Combining LUTs.\n");
-		pool<RTLIL::Cell*> worklist = luts;
-		while (worklist.size())
+
+		while (topological_order.size())
 		{
-			auto lutA = worklist.pop();
+			auto lutA = topological_order.front();
+			topological_order.pop_front();
+			if (!available_luts.count(lutA))
+				continue;
+			available_luts.erase(lutA);
+
 			SigSpec lutA_input = sigmap(lutA->getPort("\\A"));
 			SigSpec lutA_output = sigmap(lutA->getPort("\\Y")[0]);
 			int lutA_width = lutA->getParam("\\WIDTH").as_int();
@@ -203,7 +266,7 @@ struct OptLutWorker
 			if (lutA_output_ports.size() != 2)
 				continue;
 
-			for (auto &port : lutA_output_ports)
+			for (auto port : lutA_output_ports)
 			{
 				if (port.cell == lutA)
 					continue;
@@ -394,8 +457,9 @@ struct OptLutWorker
 					luts_arity.erase(lutR);
 					lutR->module->remove(lutR);
 
-					worklist.insert(lutM);
-					worklist.erase(lutR);
+					available_luts.insert(lutM);
+					topological_order.push_back(lutM);
+					available_luts.erase(lutR);
 
 					combined_count++;
 				}
