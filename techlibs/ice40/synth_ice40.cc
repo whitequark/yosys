@@ -63,6 +63,9 @@ struct SynthIce40Pass : public ScriptPass
 		log("    -retime\n");
 		log("        run 'abc' with -dff option\n");
 		log("\n");
+		log("    -relut\n");
+		log("        combine LUTs after synthesis\n");
+		log("\n");
 		log("    -nocarry\n");
 		log("        do not use SB_CARRY cells in output netlist\n");
 		log("\n");
@@ -93,7 +96,7 @@ struct SynthIce40Pass : public ScriptPass
 	}
 
 	string top_opt, blif_file, edif_file, json_file;
-	bool nocarry, nodffe, nobram, flatten, retime, noabc, abc2, vpr;
+	bool nocarry, nodffe, nobram, flatten, retime, relut, noabc, abc2, vpr;
 	int min_ce_use;
 
 	void clear_flags() YS_OVERRIDE
@@ -108,6 +111,7 @@ struct SynthIce40Pass : public ScriptPass
 		nobram = false;
 		flatten = true;
 		retime = false;
+		relut = false;
 		noabc = false;
 		abc2 = false;
 		vpr = false;
@@ -155,6 +159,10 @@ struct SynthIce40Pass : public ScriptPass
 			}
 			if (args[argidx] == "-retime") {
 				retime = true;
+				continue;
+			}
+			if (args[argidx] == "-relut") {
+				relut = true;
 				continue;
 			}
 			if (args[argidx] == "-nocarry") {
@@ -273,6 +281,10 @@ struct SynthIce40Pass : public ScriptPass
 				run("abc -lut 4", "(skip if -noabc)");
 			}
 			run("clean");
+			if (relut || help_mode) {
+				run("ice40_unlut", "                            (only if -relut)");
+				run("opt_lut -dlogic SB_CARRY:I0=1:I1=2:CI=3", "(only if -relut)");
+			}
 		}
 
 		if (check_label("map_cells"))
