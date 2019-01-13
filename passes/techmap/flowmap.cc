@@ -135,10 +135,11 @@ static void dump_dot_graph(string filename,
                                    [](RTLIL::SigBit) { return GraphStyle{}; },
                            std::function<GraphStyle(RTLIL::SigBit, RTLIL::SigBit)> edge_style =
                                    [](RTLIL::SigBit, RTLIL::SigBit) { return GraphStyle{}; },
+                           dict<RTLIL::SigBit, pool<RTLIL::SigBit>> clusters = {},
                            string name = "")
 {
 	FILE *f = fopen(filename.c_str(), "w");
-	fprintf(f, "digraph \"%s\" {\n", name.c_str());
+	fprintf(f, "digraph \"%s\" {\n", dot_escape(name).c_str());
 	fprintf(f, "  rankdir=\"TB\";\n");
 
 	dict<RTLIL::SigBit, int> ids;
@@ -165,11 +166,50 @@ static void dump_dot_graph(string filename,
 			fprintf(f, "n%d; ", ids[input]);
 	fprintf(f, "}\n");
 
-	fprintf(f, "  { rank=\"sink\"; ");
-	for (auto output : outputs)
-		if (nodes[output])
-			fprintf(f, "n%d; ", ids[output]);
-	fprintf(f, "}\n");
+	if (clusters.empty())
+	{
+		fprintf(f, "  { rank=\"sink\"; ");
+		for (auto output : outputs)
+			if (nodes[output])
+				fprintf(f, "n%d; ", ids[output]);
+		fprintf(f, "}\n");
+	}
+	else
+	{
+		pool<RTLIL::SigBit> cluster_roots;
+		for (auto cluster : clusters)
+			cluster_roots.insert(cluster.first);
+		for (auto cluster : clusters)
+			for (auto node : cluster.second)
+				cluster_roots.erase(node);
+
+		pool<RTLIL::SigBit> visited;
+		std::function<void(RTLIL::SigBit, int)> visit_cluster_node =
+		[&](RTLIL::SigBit node, int depth)
+		{
+			if (clusters.count(node))
+			{
+				fprintf(f, "subgraph cluster%d { color=\"/set18/%d\"; ", ids[node], 1 + depth % 8);
+				for (auto sub_node : clusters[node])
+					if (sub_node != node)
+						visit_cluster_node(sub_node, depth + 1);
+				if (!visited[node])
+					fprintf(f, "n%d; ", ids[node]);
+				fprintf(f, "} ");
+			}
+			else
+			{
+				fprintf(f, "n%d; ", ids[node]);
+				visited.insert(node);
+			}
+		};
+		for (auto cluster : clusters)
+		{
+			fprintf(f, "  ");
+			visit_cluster_node(cluster.first, /*depth=*/0);
+			fprintf(f, "\n");
+		}
+	}
 
 	for (auto edge : edges)
 	{
@@ -464,6 +504,7 @@ struct FlowmapWorker
 	dict<RTLIL::SigBit, pool<RTLIL::SigBit>> lut_gates;
 	dict<RTLIL::SigBit, pool<RTLIL::SigBit>> lut_edges_fw, lut_edges_bw;
 	dict<RTLIL::SigBit, int> lut_depths, lut_altitudes, lut_slacks;
+	dict<RTLIL::SigBit, pool<RTLIL::SigBit>> lut_mffcs;
 
 	int gate_count = 0, lut_count = 0, packed_count = 0;
 	int gate_area = 0, lut_area = 0;
@@ -475,9 +516,11 @@ struct FlowmapWorker
 	};
 
 	void dump_dot_graph(string filename, GraphMode mode,
-	                    pool<RTLIL::SigBit> subgraph_nodes = {}, dict<RTLIL::SigBit, pool<RTLIL::SigBit>> subgraph_edges = {},
+	                    pool<RTLIL::SigBit> subgraph_nodes = {},
+	                    dict<RTLIL::SigBit, pool<RTLIL::SigBit>> subgraph_edges = {},
 	                    dict<RTLIL::SigBit, pool<RTLIL::SigBit>> collapsed = {},
-	                    pair<pool<RTLIL::SigBit>, pool<RTLIL::SigBit>> cut = {})
+	                    pair<pool<RTLIL::SigBit>, pool<RTLIL::SigBit>> cut = {},
+	                    dict<RTLIL::SigBit, pool<RTLIL::SigBit>> clusters = {})
 	{
 		if (subgraph_nodes.empty())
 			subgraph_nodes = nodes;
@@ -520,7 +563,7 @@ struct FlowmapWorker
 		auto edge_style = [&](RTLIL::SigBit, RTLIL::SigBit) {
 			return GraphStyle{};
 		};
-		::dump_dot_graph(filename, subgraph_nodes, subgraph_edges, inputs, outputs, node_style, edge_style, module->name.str());
+		::dump_dot_graph(filename, subgraph_nodes, subgraph_edges, inputs, outputs, node_style, edge_style, clusters, module->name.str());
 	}
 
 	void dump_dot_lut_graph(string filename, GraphMode mode)
@@ -528,7 +571,7 @@ struct FlowmapWorker
 		pool<RTLIL::SigBit> lut_and_input_nodes;
 		lut_and_input_nodes.insert(lut_nodes.begin(), lut_nodes.end());
 		lut_and_input_nodes.insert(inputs.begin(), inputs.end());
-		dump_dot_graph(filename, mode, lut_and_input_nodes, lut_edges_fw, lut_gates);
+		dump_dot_graph(filename, mode, lut_and_input_nodes, lut_edges_fw, lut_gates, {}, lut_mffcs);
 	}
 
 	pool<RTLIL::SigBit> find_subgraph(RTLIL::SigBit sink)
@@ -1323,6 +1366,96 @@ struct FlowmapWorker
 		return false;
 	}
 
+	// Kahn's algorithm
+	vector<RTLIL::SigBit> topological_sort(const pool<RTLIL::SigBit> &nodes,
+	                                       const dict<RTLIL::SigBit, pool<RTLIL::SigBit>> &edges_fw,
+	                                       const dict<RTLIL::SigBit, pool<RTLIL::SigBit>> &edges_bw,
+	                                       const pool<RTLIL::SigBit> &inputs)
+	{
+		vector<RTLIL::SigBit> sorted;
+		pool<RTLIL::SigBit> worklist = inputs;
+		pool<pair<RTLIL::SigBit, RTLIL::SigBit>> visited;
+		while (!worklist.empty())
+		{
+			auto node = worklist.pop();
+			sorted.push_back(node);
+			for (auto node_succ : edges_fw.at(node))
+			{
+				if (!nodes.count(node_succ))
+					continue;
+				visited.insert({node, node_succ});
+				bool has_other_edges = false;
+				for (auto node_succ_pred : edges_bw.at(node_succ))
+					if (!visited[{node_succ_pred, node_succ}])
+						has_other_edges = true;
+				if (!has_other_edges)
+					worklist.insert(node_succ);
+			}
+		}
+		return sorted;
+	}
+
+	pool<RTLIL::SigBit> compute_lut_cone(RTLIL::SigBit root, bool output)
+	{
+		pool<RTLIL::SigBit> cone, worklist = {root};
+		auto lut_edges = output ? lut_edges_fw : lut_edges_bw;
+		while (!worklist.empty())
+		{
+			auto lut = worklist.pop();
+			for (auto lut_predsucc : lut_edges[lut])
+			{
+				if (!lut_nodes[lut_predsucc])
+					continue;
+				if (!cone[lut_predsucc])
+				{
+					cone.insert(lut_predsucc);
+					worklist.insert(lut_predsucc);
+				}
+			}
+		}
+		return cone;
+	}
+
+	void compute_lut_mffcs()
+	{
+		auto topo_luts = topological_sort(lut_nodes, lut_edges_fw, lut_edges_bw, inputs);
+		dict<RTLIL::SigBit, size_t> lut_order;
+		for (auto lut : topo_luts)
+			lut_order[lut] = lut_order.size();
+
+		lut_mffcs.clear();
+		for (auto lut : topo_luts)
+		{
+			pool<RTLIL::SigBit> lut_input_cone = compute_lut_cone(lut, /*output=*/false);
+			vector<RTLIL::SigBit> lut_input_cone_topo;
+			lut_input_cone_topo.insert(lut_input_cone_topo.end(), lut_input_cone.begin(), lut_input_cone.end());
+			std::sort(lut_input_cone_topo.begin(), lut_input_cone_topo.end(),
+				[&](RTLIL::SigBit &a, RTLIL::SigBit &b) {
+					return lut_order[a] > lut_order[b];
+				});
+
+			pool<RTLIL::SigBit> lut_mffc = {lut};
+			for (auto input_cone_node : lut_input_cone_topo)
+			{
+				bool pred_succ_outside_cone = false;
+				for (auto input_cone_node_succ : lut_edges_fw[input_cone_node])
+				{
+					if (!lut_nodes[input_cone_node_succ])
+						continue;
+					if (!lut_mffc[input_cone_node_succ])
+					{
+						pred_succ_outside_cone = true;
+						break;
+					}
+				}
+				if (!pred_succ_outside_cone)
+					lut_mffc.insert(lut_mffcs[input_cone_node].begin(), lut_mffcs[input_cone_node].end());
+			}
+
+			lut_mffcs[lut] = lut_mffc;
+		}
+	}
+
 	void optimize_area(int depth, int optarea)
 	{
 		dict<RTLIL::SigBit, pool<RTLIL::SigBit>> lut_critical_outputs;
@@ -1333,6 +1466,14 @@ struct FlowmapWorker
 		{
 			log("Relaxing with depth bound %d.\n", depth_bound);
 			bool fully_relaxed = relax_depth_for_bound(depth_bound == depth, depth_bound, lut_critical_outputs);
+
+			log("Partitioning to MFFCs.\n");
+			compute_lut_mffcs();
+			if (debug)
+			{
+				dump_dot_lut_graph(stringf("flowmap-mffc-%d.dot", depth_bound), GraphMode::Label);
+				log("  Dumped MFFC graph to `flowmap-mffc-%d.dot`.\n", depth_bound);
+			}
 
 			if (fully_relaxed)
 				break;
