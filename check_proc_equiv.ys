@@ -1,0 +1,12 @@
+hierarchy -auto-top
+design -save original
+proc_init; proc_mux; proc_dff; proc_clean;; opt -full;; write_ilang mux.il; show -prefix mux;
+design -stash proc_mux
+design -load original
+proc_init; proc_match; proc_dff; proc_clean;; write_ilang match.il; show -prefix match;
+design -stash proc_match
+
+design -copy-from proc_mux   -as gold A:top
+design -copy-from proc_match -as gate A:top
+miter -equiv -ignore_gold_x -make_outputs -make_assert -flatten gold gate miter
+sat -verify -show-ports -seq 1 -prove-asserts miter
