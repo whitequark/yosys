@@ -338,7 +338,7 @@ class dict
 	}
 
 public:
-	class const_iterator : public std::iterator<std::forward_iterator_tag, std::pair<K, T>>
+	class const_iterator : public std::iterator<std::random_access_iterator_tag, const std::pair<K, T>>
 	{
 		friend class dict;
 	protected:
@@ -348,6 +348,10 @@ public:
 	public:
 		const_iterator() { }
 		const_iterator operator++() { index--; return *this; }
+		const_iterator operator+(int off) { return const_iterator(ptr, index - off); }
+		const_iterator operator--() { index++; return *this; }
+		const_iterator operator-(int off) { return const_iterator(ptr, index + off); }
+		int operator-(const const_iterator &other) { return other.index - index; }
 		bool operator<(const const_iterator &other) const { return index > other.index; }
 		bool operator==(const const_iterator &other) const { return index == other.index; }
 		bool operator!=(const const_iterator &other) const { return index != other.index; }
@@ -355,7 +359,7 @@ public:
 		const std::pair<K, T> *operator->() const { return &ptr->entries[index].udata; }
 	};
 
-	class iterator : public std::iterator<std::forward_iterator_tag, std::pair<K, T>>
+	class iterator : public std::iterator<std::random_access_iterator_tag, std::pair<K, T>>
 	{
 		friend class dict;
 	protected:
@@ -365,6 +369,10 @@ public:
 	public:
 		iterator() { }
 		iterator operator++() { index--; return *this; }
+		iterator operator+(int off) const { return iterator(ptr, index - off); }
+		iterator operator--() { index++; return *this; }
+		iterator operator-(int off) const { return iterator(ptr, index + off); }
+		int operator-(const iterator &other) { return other.index - index; }
 		bool operator<(const iterator &other) const { return index > other.index; }
 		bool operator==(const iterator &other) const { return index == other.index; }
 		bool operator!=(const iterator &other) const { return index != other.index; }
@@ -558,11 +566,19 @@ public:
 
 	iterator begin() { return iterator(this, int(entries.size())-1); }
 	iterator element(int n) { return iterator(this, int(entries.size())-1-n); }
-	iterator end() { return iterator(nullptr, -1); }
+	iterator end() { return iterator(this, -1); }
+
+	std::reverse_iterator<iterator> rbegin() { return std::reverse_iterator<iterator>(end()); }
+	std::reverse_iterator<iterator> relement(int n) { return std::reverse_iterator<iterator>(element(n)); }
+	std::reverse_iterator<iterator> rend() { return std::reverse_iterator<iterator>(begin()); }
 
 	const_iterator begin() const { return const_iterator(this, int(entries.size())-1); }
 	const_iterator element(int n) const { return const_iterator(this, int(entries.size())-1-n); }
-	const_iterator end() const { return const_iterator(nullptr, -1); }
+	const_iterator end() const { return const_iterator(this, -1); }
+
+	std::reverse_iterator<const_iterator> rbegin() const { return std::reverse_iterator<const_iterator>(end()); }
+	std::reverse_iterator<const_iterator> relement(int n) const { return std::reverse_iterator<const_iterator>(element(n)); }
+	std::reverse_iterator<const_iterator> rend() const { return std::reverse_iterator<const_iterator>(begin()); }
 };
 
 template<typename K, typename OPS>
@@ -692,7 +708,7 @@ protected:
 	}
 
 public:
-	class const_iterator : public std::iterator<std::forward_iterator_tag, K>
+	class const_iterator : public std::iterator<std::random_access_iterator_tag, const K>
 	{
 		friend class pool;
 	protected:
@@ -702,13 +718,17 @@ public:
 	public:
 		const_iterator() { }
 		const_iterator operator++() { index--; return *this; }
+		const_iterator operator+(int off) const { return const_iterator(ptr, index - off); }
+		const_iterator operator--() { index++; return *this; }
+		const_iterator operator-(int off) const { return const_iterator(ptr, index + off); }
+		int operator-(const const_iterator &other) { return other.index - index; }
 		bool operator==(const const_iterator &other) const { return index == other.index; }
 		bool operator!=(const const_iterator &other) const { return index != other.index; }
 		const K &operator*() const { return ptr->entries[index].udata; }
 		const K *operator->() const { return &ptr->entries[index].udata; }
 	};
 
-	class iterator : public std::iterator<std::forward_iterator_tag, K>
+	class iterator : public std::iterator<std::random_access_iterator_tag, K>
 	{
 		friend class pool;
 	protected:
@@ -718,6 +738,10 @@ public:
 	public:
 		iterator() { }
 		iterator operator++() { index--; return *this; }
+		iterator operator+(int off) const { return iterator(ptr, index - off); }
+		iterator operator--() { index++; return *this; }
+		iterator operator-(int off) const { return iterator(ptr, index + off); }
+		int operator-(const iterator &other) { return other.index - index; }
 		bool operator==(const iterator &other) const { return index == other.index; }
 		bool operator!=(const iterator &other) const { return index != other.index; }
 		K &operator*() { return ptr->entries[index].udata; }
@@ -884,11 +908,19 @@ public:
 
 	iterator begin() { return iterator(this, int(entries.size())-1); }
 	iterator element(int n) { return iterator(this, int(entries.size())-1-n); }
-	iterator end() { return iterator(nullptr, -1); }
+	iterator end() { return iterator(this, -1); }
+
+	std::reverse_iterator<iterator> rbegin() { return std::reverse_iterator<iterator>(end()); }
+	std::reverse_iterator<iterator> relement(int n) { return std::reverse_iterator<iterator>(element(n)); }
+	std::reverse_iterator<iterator> rend() { return std::reverse_iterator<iterator>(begin()); }
 
 	const_iterator begin() const { return const_iterator(this, int(entries.size())-1); }
 	const_iterator element(int n) const { return const_iterator(this, int(entries.size())-1-n); }
-	const_iterator end() const { return const_iterator(nullptr, -1); }
+	const_iterator end() const { return const_iterator(this, -1); }
+
+	std::reverse_iterator<const_iterator> rbegin() const { return std::reverse_iterator<const_iterator>(end()); }
+	std::reverse_iterator<const_iterator> relement(int n) const { return std::reverse_iterator<const_iterator>(element(n)); }
+	std::reverse_iterator<const_iterator> rend() const { return std::reverse_iterator<const_iterator>(begin()); }
 };
 
 template<typename K, int offset, typename OPS>
@@ -958,6 +990,10 @@ public:
 	const_iterator begin() const { return database.begin(); }
 	const_iterator element(int n) const { return database.element(n); }
 	const_iterator end() const { return database.end(); }
+
+	std::reverse_iterator<const_iterator> rbegin() const { return std::reverse_iterator<const_iterator>(end()); }
+	std::reverse_iterator<const_iterator> relement(int n) const { return std::reverse_iterator<const_iterator>(element(n)); }
+	std::reverse_iterator<const_iterator> rend() const { return std::reverse_iterator<const_iterator>(begin()); }
 };
 
 template<typename K, typename OPS>
