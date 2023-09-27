@@ -24,6 +24,7 @@
 #include "kernel/rtlil.h"
 #include "kernel/sigtools.h"
 #include "kernel/ff.h"
+#include "kernel/modtools.h"
 
 USING_YOSYS_NAMESPACE
 PRIVATE_NAMESPACE_BEGIN
@@ -46,12 +47,12 @@ bool is_binary_cell(IdString type)
 		ID($add), ID($sub), ID($mul), ID($div), ID($mod), ID($modfloor));
 }
 
-bool is_extending_cell(IdString type)
-{
-	return !type.in(
-		ID($logic_not), ID($logic_and), ID($logic_or),
-		ID($reduce_and), ID($reduce_or), ID($reduce_xor), ID($reduce_xnor), ID($reduce_bool));
-}
+// bool is_extending_cell(IdString type)
+// {
+// 	return !type.in(
+// 		ID($logic_not), ID($logic_and), ID($logic_or),
+// 		ID($reduce_and), ID($reduce_or), ID($reduce_xor), ID($reduce_xnor), ID($reduce_bool));
+// }
 
 bool is_pure_cell(IdString type)
 {
@@ -59,10 +60,10 @@ bool is_pure_cell(IdString type)
 		ID($mux), ID($concat), ID($slice), ID($pmux), ID($bmux), ID($demux));
 }
 
-bool is_internal_cell(IdString type)
-{
-	return !type.isPublic() && !type.begins_with("$paramod");
-}
+// bool is_internal_cell(IdString type)
+// {
+// 	return !type.isPublic() && !type.begins_with("$paramod");
+// }
 
 struct CxxWriter {
 	// to be filled in later
@@ -94,7 +95,9 @@ struct UnionFind {
 	mutable std::shared_ptr<Inner> inner;
 
 	UnionFind() : inner(std::make_shared<Inner>()) {}
-	UnionFind(std::shared_ptr<Inner> inner) : inner(inner) {}
+	UnionFind(const UnionFind &other) : inner(other.inner) {}
+	UnionFind(const std::shared_ptr<Inner> &inner) : inner(inner) {}
+	UnionFind &operator=(const UnionFind &other) { inner = other.inner; return *this; }
 
 	void unify(UnionFind &other) {
 		find().inner->parent = other.inner;
@@ -176,85 +179,175 @@ struct ObservableBit {
 
 struct CxxrtlModWorker {
 	Module *module = nullptr;
-	SigMap sigmap;
+	ModWalker *walker;
+	SigMap *sigmap;
+	dict<Cell*, Cell*> cell_mffcs; // cell -> cell whose MFFC it is in
 	dict<SigBit, UnionFind> bit_domains;
 
 	void set(Module *module)
 	{
 		this->module = module;
-		sigmap.set(module);
+		walker = new ModWalker(module->design, module);
+		sigmap = &walker->sigmap;
+	}
+
+	void analyze_fanout()
+	{
+		log_debug("Computing maximum fanout free cones.\n");
+		pool<Cell*> worklist;
+		for (auto cell : module->cells())
+			if (is_pure_cell(cell->type)) {
+				cell_mffcs[cell] = cell;
+				worklist.insert(cell);
+			}
+		while (!worklist.empty()) {
+			Cell *cell = worklist.pop();
+			pool<ModWalker::PortBit> drivers;
+			for (auto conn : cell->connections())
+				if (cell->input(conn.first))
+					walker->get_drivers(drivers, conn.second);
+			for (auto driver : drivers) {
+				pool<Cell*> consumers_for_driver;
+				for (auto conn : driver.cell->connections())
+					if (cell->output(conn.first)) {
+						pool<ModWalker::PortBit> consumers;
+						walker->get_consumers(consumers, conn.second);
+						for (auto consumer : consumers)
+							consumers_for_driver.insert(consumer.cell);
+					}
+				bool all_consumers_in_mffc = true;
+				for (auto consumer : consumers_for_driver)
+					if (cell_mffcs.count(consumer) && cell_mffcs[consumer] != cell)
+						all_consumers_in_mffc = false;
+				if (all_consumers_in_mffc) {
+					cell_mffcs[driver.cell] = cell;
+					worklist.insert(driver.cell);
+				}
+			}
+		}
+	}
+
+	void print_fanout()
+	{
+		log("Printing maximum fanout free cones.\n");
+		dict<Cell*, pool<Cell*>> mffcs;
+		for (auto cell_mffc : cell_mffcs)
+			mffcs[cell_mffc.second].insert(cell_mffc.first);
+		for (auto mffc : mffcs) {
+			log("Cell %s\n", log_id(mffc.first));
+			for (auto node : mffc.second)
+				log("\t%s\n", log_id(node));
+		}
 	}
 
 	void analyze_bit_domains()
 	{
 		log_debug("Splitting design into event domains.\n");
 
+		// Each bit gets its own domain initially.
+		for (auto wire : module->wires())
+			for (auto bit : SigSpec(wire))
+				bit_domains[bit]; // creates a domain
+
 		// Combine domains of flip-flops with identical asynchronous control set together.
-		dict<TriggerSet, vector<pair<Cell*, int>>> async_control_sets;
+		dict<TriggerSet, vector<Cell*>> async_control_sets;
 		for (auto cell : module->cells()) {
 			if (RTLIL::builtin_ff_cell_types().count(cell->type)) {
 				FfData ff(nullptr, cell);
-				for (int i = 0; i < ff.width; i++) {
-					TriggerSet triggers;
-					if (ff.has_clk)
-						triggers.insert(ff.sig_clk, ff.pol_clk ? SyncType::STp : SyncType::STn);
-					if (ff.has_aload) {
+				TriggerSet triggers;
+				if (ff.has_clk)
+					triggers.insert(ff.sig_clk, ff.pol_clk ? SyncType::STp : SyncType::STn);
+				if (ff.has_aload) {
+					for (int i = 0; i < ff.width; i++)
 						triggers.insert(ff.sig_ad[i], SyncType::STe);
-						triggers.insert(ff.sig_aload, ff.pol_aload ? SyncType::STp : SyncType::STn);
-					}
-					if (ff.has_arst) {
-						if (ff.has_aload)
-							triggers.insert(ff.sig_arst, SyncType::STe);
-						else 
-							triggers.insert(ff.sig_arst, ff.pol_arst ? SyncType::STp : SyncType::STn);
-					}
-					if (ff.has_sr) {
+					triggers.insert(ff.sig_aload, ff.pol_aload ? SyncType::STp : SyncType::STn);
+				}
+				if (ff.has_arst) {
+					if (ff.has_aload)
+						triggers.insert(ff.sig_arst, SyncType::STe);
+					else 
+						triggers.insert(ff.sig_arst, ff.pol_arst ? SyncType::STp : SyncType::STn);
+				}
+				if (ff.has_sr) {
+					for (int i = 0; i < ff.width; i++) {
 						triggers.insert(ff.sig_clr[i], SyncType::STe);
 						triggers.insert(ff.sig_set[i], SyncType::STe);
 					}
-					async_control_sets[triggers].push_back({cell, i});
 				}
+				async_control_sets[triggers].push_back(cell);
 			}
+		}
+
+		// The outputs of a storage cell are in the same domain as its async control set.
+		for (auto it : async_control_sets) {
+			UnionFind domain;
+			for (auto cell : it.second)
+				for (auto bit : cell->getPort(ID::Q))
+					bit_domains[walker->sigmap(bit)].unify(domain);
 		}
 
 		// Unify the domain of a combinational cell with the domain of its inputs if all of the
 		// inputs are in the same domain.
 		pool<Cell*> worklist;
 		for (auto cell : module->cells())
-			if (is_pure_cell(cell->type))
-				worklist.insert(cell);
+			worklist.insert(cell);
 		while (!worklist.empty()) {
 			Cell *cell = worklist.pop();
-			UnionFind *domain = nullptr;
-			bool all_inputs_in_domain = true;
+			if (!is_pure_cell(cell->type)) continue;
+	
+			UnionFind domain;
+			bool found_input_domain = false, all_inputs_in_domain = true;
+			log_debug("Considering input domains of cell %s\n", log_id(cell));
 			for (auto &conn : cell->connections())
 				if (cell->input(conn.first)) {
 					log_assert(!cell->output(conn.first));
-					for (auto bit : conn.second) {
-						UnionFind *input_domain = &bit_domains[bit];
-						if (domain == nullptr)
+					for (auto bit : walker->sigmap(conn.second)) {
+						if (!bit.wire)
+							continue;
+						UnionFind input_domain = bit_domains[bit].find();
+						if (!found_input_domain) {
 							domain = input_domain;
-						else if (domain != input_domain) {
+							found_input_domain = true;
+						} else if (domain != input_domain)
 							all_inputs_in_domain = false;
-							break;
-						}
 					}
-					if (!all_inputs_in_domain)
-						break;
 				}
 			if (!all_inputs_in_domain)
 				continue;
 			log_debug("All inputs of cell %s are in the same domain\n", log_id(cell));
+			bool changed = false;
 			for (auto &conn : cell->connections())
 				if (cell->output(conn.first)) {
 					log_assert(!cell->input(conn.first));
-					for (auto bit : conn.second) {
-						UnionFind &output_domain = bit_domains[bit];
-						if (output_domain.singleton())
-							output_domain.unify(*domain);
+					for (auto bit : walker->sigmap(conn.second)) {
+						if (!bit.wire) 
+							continue;
+						UnionFind output_domain = bit_domains[bit];
+						if (output_domain.singleton()) {
+							log_debug("Unifying output %s with input domain\n", log_signal(bit));
+							output_domain.unify(domain);
+							changed = true;
+						}
 					}
 				}
+			if (changed) {
+				for (auto &conn : cell->connections())
+					if (cell->output(conn.first)) {
+						for (auto bit : walker->sigmap(conn.second)) {
+							if (!bit.wire) 
+								continue;
+							pool<ModWalker::PortBit> consumers;
+							walker->get_consumers(consumers, bit);
+							for (auto consumer : consumers) {
+								log_debug("Revisiting cell %s\n", log_id(consumer.cell));
+								worklist.insert(consumer.cell);
+							}
+ 						}
+					}
+			}
 		}
+		
+		
 	}
 
 	void print_bit_domains() 
@@ -264,8 +357,8 @@ struct CxxrtlModWorker {
 		for (auto bit_domain : bit_domains)
 			if (!names.count(bit_domain.second.find()))
 				names[bit_domain.second.find()] = names.size();
-		for (auto domain_name : names) {
-			log_debug("Domain %d:\n", domain_name.second);
+		for (auto domain_name : names) { // iterates in reverse order, so we reverse again
+			log("Domain %zu:\n", names.size() - domain_name.second - 1);
 			for (auto bit_domain : bit_domains)
 				if (bit_domain.second == domain_name.first)
 					log("\t%s\n", log_signal(bit_domain.first));
@@ -274,10 +367,12 @@ struct CxxrtlModWorker {
 
 	void analyze()
 	{
+		analyze_fanout();
 		analyze_bit_domains();
 	}
 
 	void print_analysis() {
+		print_fanout();
 		print_bit_domains();
 	}
 };
@@ -286,6 +381,7 @@ struct CxxrtlWorker {
 	// Options for prepare
 	bool run_hierarchy = false;
 	bool run_flatten = false;
+	bool run_proc = false;
 	// Options for analyze
 	bool print_analysis = false;
 
@@ -307,7 +403,8 @@ struct CxxrtlWorker {
 			Pass::call(design, "hierarchy -auto-top");
 		if (run_flatten)
 			Pass::call(design, "flatten");
-		Pass::call(design, "proc");
+		if (run_proc)
+			Pass::call(design, "proc");
 		log_pop();
 	}
 
@@ -340,6 +437,7 @@ struct Cxxrtl2Backend : public Backend {
 	{
 		bool nohierarchy = false;
 		bool noflatten = false;
+		bool noproc = false;
 		bool print_analysis = false;
 		CxxrtlWorker worker;
 
@@ -356,6 +454,10 @@ struct Cxxrtl2Backend : public Backend {
 				noflatten = true;
 				continue;
 			}
+			if (args[argidx] == "-noproc") {
+				noproc = true;
+				continue;
+			}
 			if (args[argidx] == "-print-analysis") {
 				print_analysis = true;
 				continue;
@@ -366,6 +468,7 @@ struct Cxxrtl2Backend : public Backend {
 
 		worker.run_hierarchy = !nohierarchy;
 		worker.run_flatten = !noflatten;
+		worker.run_proc = !noproc;
 		worker.print_analysis = print_analysis;
 
 		worker.prepare_design(design);
