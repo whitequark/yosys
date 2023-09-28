@@ -25,6 +25,8 @@
 #include "kernel/sigtools.h"
 #include "kernel/ff.h"
 #include "kernel/modtools.h"
+#include "kernel/utils.h"
+#include "kernel/mem.h"
 
 USING_YOSYS_NAMESPACE
 PRIVATE_NAMESPACE_BEGIN
@@ -66,7 +68,103 @@ bool is_pure_cell(IdString type)
 // }
 
 struct CxxWriter {
-	// to be filled in later
+	std::ostream *out = nullptr;
+	std::vector<std::pair<std::stringstream, std::stringstream>> scopes;
+	std::string level;
+
+	void indent()
+	{
+		level += "\t";
+	}
+
+	void dedent()
+	{
+		level.resize(level.size() - 1);
+	}
+
+	void write(char c)
+	{
+		*out << c;
+		if (c == '\n')
+			*out << level;
+	}
+
+	void write(const std::string &s)
+	{
+		for (char c : s)
+			write(c);
+	}
+
+	void writeln(const std::string &s = "")
+	{
+		write(s);
+		write('\n');
+	}
+	
+	std::stringstream& decl()
+	{
+		log_assert(!scopes.empty());
+		return scopes.back().first;
+	}
+
+	std::stringstream& body()
+	{
+		log_assert(!scopes.empty());
+		return scopes.back().second;
+	}
+
+	void push()
+	{
+		indent();
+		
+		scopes.push_back({});
+	}
+	
+	void pop()
+	{
+		log_assert(!scopes.empty());
+		
+		auto &scope = scopes.back();
+		write(scope.first.str());
+		write("\n");
+		write(scope.second.str());
+		scopes.pop_back();
+		
+		dedent();
+	}
+};
+
+struct CxxrtlWriter {
+	CxxWriter cxx;
+
+	std::string design_ns = "cxxrtl_design";
+
+	void begin(std::ostream &f)
+	{
+		cxx.out = &f;
+
+		cxx.writeln("#include <backends/cxxrtl/cxxrtl.h>");
+		cxx.writeln();
+		cxx.writeln("#if defined(CXXRTL_INCLUDE_CAPI_IMPL) || \\");
+		cxx.writeln("    defined(CXXRTL_INCLUDE_VCD_CAPI_IMPL)");
+		cxx.writeln("#include <backends/cxxrtl/cxxrtl_capi.cc>");
+		cxx.writeln("#endif");
+		cxx.writeln();
+		cxx.writeln("#if defined(CXXRTL_INCLUDE_VCD_CAPI_IMPL)");
+		cxx.writeln("#include <backends/cxxrtl/cxxrtl_vcd_capi.cc>");
+		cxx.writeln("#endif");
+		cxx.writeln();
+		cxx.writeln("using namespace cxxrtl_yosys;");
+		cxx.writeln();
+		cxx.writeln("namespace " + design_ns + " {");
+		cxx.writeln();
+	}
+
+	void end()
+	{
+		cxx.writeln("} // namespace " + design_ns);
+		cxx.writeln();
+	}
 };
 
 // Async triggers matter because they influence observable behavior.
@@ -85,6 +183,425 @@ struct CxxWriter {
 // not directly correlate with what primary outputs are affected to (since they can be affected
 // by any primary inputs) and in complex cases there will be many async domains, one triggered by
 // another, eventually feeding each of the primary outputs.
+
+struct TriggerSet {
+	enum Polarity {
+		Pos = 1,
+		Neg = 2,
+		Both = 3,
+	};
+
+	dict<SigBit, int> bits;
+
+	static TriggerSet singleton(SigBit bit, SyncType sync) 
+	{
+		TriggerSet set;
+		set.insert(bit, sync);
+		return set;
+	}
+
+	void insert(SigBit bit, SyncType sync) 
+	{
+		switch(sync) {
+			case SyncType::STe:
+				bits[bit] = Polarity::Both;
+				break;
+			case SyncType::STp:
+				bits[bit] = bits[bit] | Polarity::Pos;
+				break;
+			case SyncType::STn:
+				bits[bit] = bits[bit] | Polarity::Neg;
+				break;
+			default:
+				log_assert(false);
+		}
+	}
+
+	vector<std::pair<SigChunk, int>> chunks()
+	{
+		dict<int, SigSpec> signals;
+		vector<std::pair<SigChunk, int>> chunks;
+		for (auto it : bits)
+			signals[it.second].append(it.first);
+		for (auto it : signals) {
+			it.second.sort_and_unify();
+			for (auto chunk : it.second.chunks())
+				chunks.push_back({ chunk, it.first });
+		}
+		return chunks;
+	}
+
+	unsigned int hash() const { return bits.hash(); }
+
+	bool operator==(const TriggerSet &other) const { return bits == other.bits; }
+
+	bool operator!=(const TriggerSet &other) const { return bits != other.bits; }
+
+	TriggerSet &operator|=(const TriggerSet &other) {
+		for (auto it: other.bits)
+			bits[it.first] |= it.second;
+		return *this;
+	}
+};
+
+
+struct CxxrtlModWorker {
+	Module *module = nullptr;
+	ModWalker *walker;
+	SigMap *sigmap;
+
+	dict<SigBit, int> bit_triggers;
+	dict<Cell*, int> cell_triggers;
+	dict<IdString, int> memory_triggers;
+
+	dict<TriggerSet, int> trigger_sets_dict;
+	vector<std::pair<TriggerSet, vector<Cell*>>> trigger_sets;
+
+	CxxrtlModWorker(Module *module) : module(module)
+	{
+		walker = new ModWalker(module->design, module);
+		sigmap = &walker->sigmap;
+	}
+
+	int get_trigger_set(const TriggerSet &triggers)	{
+		if (trigger_sets_dict.count(triggers)) {
+			return trigger_sets_dict[triggers];
+		} else {
+			int res = trigger_sets.size();
+			trigger_sets.push_back({triggers, {}});
+			trigger_sets_dict[triggers] = res;
+			return res;
+		}
+	}
+
+	TriggerSet get_ff_triggers(Cell *cell) {
+		FfData ff(nullptr, cell);
+		TriggerSet triggers;
+		if (ff.has_clk)
+			triggers.insert(walker->sigmap(ff.sig_clk), ff.pol_clk ? SyncType::STp : SyncType::STn);
+		if (ff.has_aload) {
+			for (int i = 0; i < ff.width; i++)
+				triggers.insert(walker->sigmap(ff.sig_ad[i]), SyncType::STe);
+			triggers.insert(walker->sigmap(ff.sig_aload), ff.pol_aload ? SyncType::STp : SyncType::STn);
+		}
+		if (ff.has_arst) {
+			if (ff.has_aload)
+				triggers.insert(walker->sigmap(ff.sig_arst), SyncType::STe);
+			else 
+				triggers.insert(walker->sigmap(ff.sig_arst), ff.pol_arst ? SyncType::STp : SyncType::STn);
+		}
+		if (ff.has_sr) {
+			for (int i = 0; i < ff.width; i++) {
+				triggers.insert(walker->sigmap(ff.sig_clr[i]), SyncType::STe);
+				triggers.insert(walker->sigmap(ff.sig_set[i]), SyncType::STe);
+			}
+		}
+		return triggers;
+	}
+
+	void analyze_event_domains()
+	{
+		log_debug("Splitting design into event domains.\n");
+
+		vector<Mem> memories = Mem::get_all_memories(module);
+		dict<Cell*, Mem*> rport_to_mem;
+
+		TopoSort<Cell*> topo;
+		for (auto cell : module->cells()) {
+			if (is_pure_cell(cell->type) || (cell->type.in(ID($memrd), ID($memrd_v2)) && !cell->getParam(ID::CLK_ENABLE).as_bool())) {
+				topo.node(cell);
+				pool<ModWalker::PortBit> drivers;
+				for (auto &conn: cell->connections())
+					if (cell->input(conn.first))
+						for (auto bit: walker->sigmap(conn.second))
+							walker->get_drivers(drivers, bit);
+				for (auto driver : drivers)
+					topo.edge(driver.cell, cell);
+			}
+		}
+		for (auto &mem: memories) {
+			for (auto &rport: mem.rd_ports) {
+				rport_to_mem[rport.cell] = &mem;
+				if (!rport.clk_enable) {
+					for (auto &wport: mem.wr_ports) {
+						topo.edge(wport.cell, rport.cell);
+					}
+				} else {
+					TriggerSet triggers;
+					triggers.insert(walker->sigmap(rport.clk), rport.clk_polarity ? SyncType::STp : SyncType::STn);
+					if (!rport.arst.is_fully_const())
+						triggers.insert(walker->sigmap(rport.arst), SyncType::STp);
+					int tset = get_trigger_set(triggers);
+					cell_triggers[rport.cell] = tset;
+					for (auto bit: walker->sigmap(rport.data)) {
+						bit_triggers[bit] = tset;
+					}
+					trigger_sets[tset].second.push_back(rport.cell);
+				}
+			}
+			TriggerSet mem_triggers;
+			for (auto &wport : mem.wr_ports) {
+				TriggerSet triggers;
+				log_assert(wport.clk_enable);
+				triggers.insert(walker->sigmap(wport.clk), wport.clk_polarity ? SyncType::STp : SyncType::STn);
+				mem_triggers |= triggers;
+				int tset = get_trigger_set(triggers);
+				cell_triggers[wport.cell] = tset;
+				trigger_sets[tset].second.push_back(wport.cell);
+			}
+			memory_triggers[mem.memid] = get_trigger_set(mem_triggers);
+		}
+
+		for (auto cell: module->cells()) {
+			if (RTLIL::builtin_ff_cell_types().count(cell->type)) {
+				int tset = get_trigger_set(get_ff_triggers(cell));
+				cell_triggers[cell] = tset;
+				for (auto bit: walker->sigmap(cell->getPort(ID::Q))) {
+					bit_triggers[bit] = tset;
+				}
+				trigger_sets[tset].second.push_back(cell);
+			}
+		}
+
+		topo.sort();
+
+		for (auto cell: topo.sorted) {
+			if (is_pure_cell(cell->type) || (cell->type.in(ID($memrd), ID($memrd_v2)) && !cell->getParam(ID::CLK_ENABLE).as_bool())) {
+				TriggerSet triggers;
+				int inputs_tset;
+				bool found_tset = false;
+				bool found_trigger = false;
+				if (cell->has_memid()) {
+					found_tset = true;
+					inputs_tset = memory_triggers.at(cell->parameters.at(ID::MEMID).decode_string());
+				}
+				for (auto &conn : cell->connections())
+					if (cell->input(conn.first))
+						for (auto bit: walker->sigmap(conn.second)) {
+							if (!bit.wire)
+								continue;
+							if (bit_triggers.count(bit)) {
+								int tset = bit_triggers[bit];
+								if (found_trigger || (found_tset && inputs_tset != tset)) {
+									if (found_tset) {
+										triggers = trigger_sets[inputs_tset].first;
+										found_tset = false;
+									}
+									found_trigger = true;
+									triggers |= trigger_sets[tset].first;
+								} else {
+									found_tset = true;
+									inputs_tset = tset;
+								}
+							} else {
+								if (found_tset) {
+									triggers = trigger_sets[inputs_tset].first;
+									found_tset = false;
+								}
+								found_trigger = true;
+								triggers.insert(bit, SyncType::STe);
+							}
+						}
+				if (found_trigger || !found_tset)
+					inputs_tset = get_trigger_set(triggers);
+				cell_triggers[cell] = inputs_tset;
+				for (auto &conn : cell->connections())
+					if (cell->output(conn.first))
+						for (auto bit: walker->sigmap(conn.second)) {
+							if (!bit.wire)
+								continue;
+							bit_triggers[bit] = inputs_tset;
+						}
+				trigger_sets[inputs_tset].second.push_back(cell);
+			}
+		}
+	}
+
+	void print_event_domains() 
+	{
+		log("Printing event domains.\n\n");
+		dict<int, std::tuple<dict<Wire*, SigSpec>, pool<Cell*>, pool<IdString>>> domains;
+		for (auto bit_domain : bit_triggers) {
+			log_assert(bit_domain.first.wire != nullptr);
+			get<0>(domains[bit_domain.second])[bit_domain.first.wire].append(bit_domain.first);
+		}
+		for (auto cell_domain : cell_triggers)
+			get<1>(domains[cell_domain.second]).insert(cell_domain.first);
+		for (auto it : memory_triggers)
+			get<2>(domains[it.second]).insert(it.first);
+		domains.sort();
+		for (auto domain : domains) { // iterates in reverse order, so we reverse again
+			log("Domain %d @(", domain.first);
+			bool first = true;
+			for (auto it: trigger_sets[domain.first].first.chunks()) {
+				if (first)
+					first = false;
+				else
+					log(", ");
+				const char *edge = "";
+				if (it.second == 1)
+					edge = "posedge ";
+				if (it.second == 2)
+					edge = "negedge ";
+				log("%s%s", edge, log_signal(it.first));
+			}
+			log(")\n");
+			get<0>(domain.second).sort<IdString::compare_ptr_by_name<Wire>>();
+			for (auto wire_spec : get<0>(domain.second)) {
+				wire_spec.second.sort_and_unify();
+				log("\twire %s\n", log_signal(wire_spec.second));
+			}
+			get<1>(domain.second).sort<IdString::compare_ptr_by_name<Cell>>();
+			for (auto cell : get<1>(domain.second))
+				log("\tcell %s\n", log_id(cell));
+			for (auto mem : get<2>(domain.second))
+				log("\tmemory %s\n", log_id(mem));
+		}
+	}
+
+	void analyze()
+	{
+		analyze_event_domains();
+	}
+
+	void print_analysis() 
+	{
+		print_event_domains();
+	}
+
+	void write(CxxrtlWriter &writer)
+	{
+		// TODO
+	}
+};
+
+struct CxxrtlWorker {
+	// Options for prepare
+	bool run_hierarchy = false;
+	bool run_flatten = false;
+	bool run_proc = false;
+	// Options for analyze
+	bool print_analysis = false;
+
+	Design *design;
+	vector<CxxrtlModWorker> mod_workers;
+
+	CxxrtlWorker(Design *design) : design(design) {}
+
+	void prepare_design()
+	{
+		if (run_hierarchy)
+			Pass::call(design, "hierarchy -auto-top");
+		if (run_flatten)
+			Pass::call(design, "flatten");
+		if (run_proc)
+			Pass::call(design, "proc");
+		Pass::call(design, "memory_unpack");
+
+		for (auto module : design->modules()) {
+			if (module->get_blackbox_attribute())
+				continue;
+			if (!design->selected_module(module))
+				continue;
+			if (!design->selected_whole_module(module))
+				log_cmd_error("Can't handle partially selected module `%s'!\n", id2cstr(module->name));
+			mod_workers.push_back(CxxrtlModWorker(module));
+		}
+	}
+
+	void analyze_design()
+	{
+		for (auto mod_worker : mod_workers) {
+			log_header(design, "Analyzing module `%s'.\n", log_id(mod_worker.module->name));
+			mod_worker.analyze();
+			
+			if (print_analysis) {
+				log_header(design, "Printing analysis for module `%s'.\n", log_id(mod_worker.module->name));
+				mod_worker.print_analysis();
+			}
+		}
+	}
+
+	void write_design(std::ostream *&f, std::string filename)
+	{
+		// TODO: handle split files, etc
+
+		CxxrtlWriter writer;
+		writer.begin(*f);
+
+		for (auto mod_worker : mod_workers) {
+			log_header(design, "Writing code for module `%s'.\n", log_id(mod_worker.module->name));
+			mod_worker.write(writer);
+		}
+
+		writer.end();
+	}
+};
+
+struct Cxxrtl2Backend : public Backend {
+	Cxxrtl2Backend() : Backend("cxxrtl2", "convert design to C++ RTL simulation") { }
+	void help() override
+	{
+		//   |---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|
+		log("\n");
+		log("    write_cxxrtl2 [options] [filename]\n");
+		log("\n");
+	}
+
+	void execute(std::ostream *&f, std::string filename, std::vector<std::string> args, Design *design) override
+	{
+		bool nohierarchy = false;
+		bool noflatten = false;
+		bool noproc = false;
+		bool print_analysis = false;
+
+		log_header(design, "Executing CXXRTL2 backend.\n");
+
+		size_t argidx;
+		for (argidx = 1; argidx < args.size(); argidx++)
+		{
+			if (args[argidx] == "-nohierarchy") {
+				nohierarchy = true;
+				continue;
+			}
+			if (args[argidx] == "-noflatten") {
+				noflatten = true;
+				continue;
+			}
+			if (args[argidx] == "-noproc") {
+				noproc = true;
+				continue;
+			}
+			if (args[argidx] == "-print-analysis") {
+				print_analysis = true;
+				continue;
+			}
+			break;
+		}
+		extra_args(f, filename, args, argidx);
+
+		CxxrtlWorker worker(design);
+		worker.run_hierarchy = !nohierarchy;
+		worker.run_flatten = !noflatten;
+		worker.run_proc = !noproc;
+		worker.print_analysis = print_analysis;
+
+		log_push();
+		worker.prepare_design();
+		worker.analyze_design();
+		worker.write_design(f, filename);
+		log_pop();
+	}
+} Cxxrtl2Backend;
+
+PRIVATE_NAMESPACE_END
+
+//
+// CODE GRAVEYARD
+//
+
+/*
+
 
 struct UnionFind {
 	struct Inner : std::enable_shared_from_this<Inner> {
@@ -131,171 +648,84 @@ struct UnionFind {
 	}
 };
 
-struct TriggerSet {
-	enum Polarity {
-		Pos = 1,
-		Neg = 2,
-		Both = 3,
-	};
+*/
 
-	dict<SigBit, int> bits;
+/*
+	dict<SigBit, int> bit_domains;
+	dict<Cell*, int> cell_domains;
+*/
 
-	void insert(SigBit bit, SyncType sync) {
-		switch(sync) {
-			case SyncType::STe:
-				bits[bit] = Polarity::Both;
-				break;
-			case SyncType::STp:
-				bits[bit] = bits[bit] | Polarity::Pos;
-				break;
-			case SyncType::STn:
-				bits[bit] = bits[bit] | Polarity::Neg;
-				break;
-			default:
-				log_assert(false);
-		}
-	}
 
-	unsigned int hash() const { return bits.hash(); }
+#if 0
+		// Domain 0 should never appear anywhere; if it appears it indicates a bug.
+		int next_domain = 1;
 
-	bool operator==(const TriggerSet &other) const { return bits == other.bits; }
+		// Each primary input is its own trigger.
+		for (auto wire : module->wires())
+			for (auto bit : walker->sigmap(wire))
+				bit_triggers[bit] = TriggerSet::singleton(bit, SyncType::STe);
 
-	bool operator!=(const TriggerSet &other) const { return bits != other.bits; }
-};
-
-struct ObservableBit {
-	SigBit bit;
-	UnionFind domain;
-
-	static std::vector<ObservableBit> from(SigSpec sigspec) {
-		std::vector<ObservableBit> bits;
-		for (auto bit : sigspec)
-			bits.emplace_back(bit);
-		return bits;
-	}
-
-	ObservableBit(SigBit bit_) : bit(bit_) {}
-};
-
-struct CxxrtlModWorker {
-	Module *module = nullptr;
-	ModWalker *walker;
-	SigMap *sigmap;
-	dict<Cell*, Cell*> cell_mffcs; // cell -> cell whose MFFC it is in
-	dict<SigBit, UnionFind> bit_domains;
-
-	void set(Module *module)
-	{
-		this->module = module;
-		walker = new ModWalker(module->design, module);
-		sigmap = &walker->sigmap;
-	}
-
-	void analyze_fanout()
-	{
-		log_debug("Computing maximum fanout free cones.\n");
-		pool<Cell*> worklist;
-		for (auto cell : module->cells())
-			if (is_pure_cell(cell->type)) {
-				cell_mffcs[cell] = cell;
-				worklist.insert(cell);
-			}
-		while (!worklist.empty()) {
-			Cell *cell = worklist.pop();
-			pool<ModWalker::PortBit> drivers;
-			for (auto conn : cell->connections())
-				if (cell->input(conn.first))
-					walker->get_drivers(drivers, conn.second);
-			for (auto driver : drivers) {
-				pool<Cell*> consumers_for_driver;
-				for (auto conn : driver.cell->connections())
-					if (cell->output(conn.first)) {
-						pool<ModWalker::PortBit> consumers;
-						walker->get_consumers(consumers, conn.second);
-						for (auto consumer : consumers)
-							consumers_for_driver.insert(consumer.cell);
-					}
-				bool all_consumers_in_mffc = true;
-				for (auto consumer : consumers_for_driver)
-					if (cell_mffcs.count(consumer) && cell_mffcs[consumer] != cell)
-						all_consumers_in_mffc = false;
-				if (all_consumers_in_mffc) {
-					cell_mffcs[driver.cell] = cell;
-					worklist.insert(driver.cell);
-				}
-			}
-		}
-	}
-
-	void print_fanout()
-	{
-		log("Printing maximum fanout free cones.\n");
-		dict<Cell*, pool<Cell*>> mffcs;
-		for (auto cell_mffc : cell_mffcs)
-			mffcs[cell_mffc.second].insert(cell_mffc.first);
-		for (auto mffc : mffcs) {
-			log("Cell %s\n", log_id(mffc.first));
-			for (auto node : mffc.second)
-				log("\t%s\n", log_id(node));
-		}
-	}
-
-	void analyze_bit_domains()
-	{
-		log_debug("Splitting design into event domains.\n");
-
+/*
 		// Each bit gets its own domain initially.
 		for (auto wire : module->wires())
-			for (auto bit : SigSpec(wire))
-				bit_domains[bit]; // creates a domain
+			for (auto bit : walker->sigmap(wire))
+				bit_domains[bit] = next_domain++; // creates a domain
+*/
 
 		// Combine domains of flip-flops with identical asynchronous control set together.
 		dict<TriggerSet, vector<Cell*>> async_control_sets;
 		for (auto cell : module->cells()) {
 			if (RTLIL::builtin_ff_cell_types().count(cell->type)) {
-				FfData ff(nullptr, cell);
-				TriggerSet triggers;
-				if (ff.has_clk)
-					triggers.insert(ff.sig_clk, ff.pol_clk ? SyncType::STp : SyncType::STn);
-				if (ff.has_aload) {
-					for (int i = 0; i < ff.width; i++)
-						triggers.insert(ff.sig_ad[i], SyncType::STe);
-					triggers.insert(ff.sig_aload, ff.pol_aload ? SyncType::STp : SyncType::STn);
-				}
-				if (ff.has_arst) {
-					if (ff.has_aload)
-						triggers.insert(ff.sig_arst, SyncType::STe);
-					else 
-						triggers.insert(ff.sig_arst, ff.pol_arst ? SyncType::STp : SyncType::STn);
-				}
-				if (ff.has_sr) {
-					for (int i = 0; i < ff.width; i++) {
-						triggers.insert(ff.sig_clr[i], SyncType::STe);
-						triggers.insert(ff.sig_set[i], SyncType::STe);
-					}
-				}
+				TriggerSet triggers = get_ff_triggers(cell);
 				async_control_sets[triggers].push_back(cell);
 			}
 		}
 
+		for (auto async_control_set : async_control_sets)
+			for (auto cell : async_control_set.second) {
+				cell_triggers[cell] = async_control_set.first;
+				for (auto bit : walker->sigmap(cell->getPort(ID::Q)))
+					bit_triggers[bit] = async_control_set.first;
+			}
+
+/*
 		// The outputs of a storage cell are in the same domain as its async control set.
 		for (auto it : async_control_sets) {
-			UnionFind domain;
-			for (auto cell : it.second)
-				for (auto bit : cell->getPort(ID::Q))
-					bit_domains[walker->sigmap(bit)].unify(domain);
+			int domain = next_domain++;
+			for (auto cell : it.second) {
+				cell_domains[cell] = domain;
+				for (auto bit : walker->sigmap(cell->getPort(ID::Q)))
+					bit_domains[bit] = domain;
+			}
 		}
+*/
 
 		// Unify the domain of a combinational cell with the domain of its inputs if all of the
 		// inputs are in the same domain.
 		pool<Cell*> worklist;
-		for (auto cell : module->cells())
-			worklist.insert(cell);
+		for (auto cell : module->cells()) {
+			if (is_pure_cell(cell->type)) {
+				int domain = next_domain++;
+				// All outputs of a combinatorial cell are in the same domain.
+				cell_domains[cell] = domain;
+				for (auto &conn : cell->connections())
+					if (cell->output(conn.first)) {
+						log_assert(!cell->input(conn.first));
+						for (auto bit : walker->sigmap(conn.second)) {
+							if (!bit.wire) 
+								continue;
+							bit_domains[bit] = domain;
+						}
+					}
+
+				worklist.insert(cell);
+			}
+		}
 		while (!worklist.empty()) {
 			Cell *cell = worklist.pop();
 			if (!is_pure_cell(cell->type)) continue;
 	
-			UnionFind domain;
+			int domain = 0;
 			bool found_input_domain = false, all_inputs_in_domain = true;
 			log_debug("Considering input domains of cell %s\n", log_id(cell));
 			for (auto &conn : cell->connections())
@@ -304,7 +734,7 @@ struct CxxrtlModWorker {
 					for (auto bit : walker->sigmap(conn.second)) {
 						if (!bit.wire)
 							continue;
-						UnionFind input_domain = bit_domains[bit].find();
+						int input_domain = bit_domains[bit];
 						if (!found_input_domain) {
 							domain = input_domain;
 							found_input_domain = true;
@@ -314,170 +744,27 @@ struct CxxrtlModWorker {
 				}
 			if (!all_inputs_in_domain)
 				continue;
+			if (domain == cell_domains[cell])
+				continue;
 			log_debug("All inputs of cell %s are in the same domain\n", log_id(cell));
-			bool changed = false;
+			cell_domains[cell] = domain;
 			for (auto &conn : cell->connections())
 				if (cell->output(conn.first)) {
 					log_assert(!cell->input(conn.first));
 					for (auto bit : walker->sigmap(conn.second)) {
 						if (!bit.wire) 
 							continue;
-						UnionFind output_domain = bit_domains[bit];
-						if (output_domain.singleton()) {
-							log_debug("Unifying output %s with input domain\n", log_signal(bit));
-							output_domain.unify(domain);
-							changed = true;
+						bit_domains[bit] = domain;
+						pool<ModWalker::PortBit> consumers;
+						walker->get_consumers(consumers, bit);
+						for (auto consumer : consumers) {
+							log_debug("Revisiting cell %s\n", log_id(consumer.cell));
+							worklist.insert(consumer.cell);
 						}
-					}
+ 					}
 				}
-			if (changed) {
-				for (auto &conn : cell->connections())
-					if (cell->output(conn.first)) {
-						for (auto bit : walker->sigmap(conn.second)) {
-							if (!bit.wire) 
-								continue;
-							pool<ModWalker::PortBit> consumers;
-							walker->get_consumers(consumers, bit);
-							for (auto consumer : consumers) {
-								log_debug("Revisiting cell %s\n", log_id(consumer.cell));
-								worklist.insert(consumer.cell);
-							}
- 						}
-					}
-			}
 		}
-		
-		
-	}
-
-	void print_bit_domains() 
-	{
-		log("Printing bit domains.\n\n");
-		dict<UnionFind, int> names;
-		for (auto bit_domain : bit_domains)
-			if (!names.count(bit_domain.second.find()))
-				names[bit_domain.second.find()] = names.size();
-		for (auto domain_name : names) { // iterates in reverse order, so we reverse again
-			log("Domain %zu:\n", names.size() - domain_name.second - 1);
-			for (auto bit_domain : bit_domains)
-				if (bit_domain.second == domain_name.first)
-					log("\t%s\n", log_signal(bit_domain.first));
-		}
-	}
-
-	void analyze()
-	{
-		analyze_fanout();
-		analyze_bit_domains();
-	}
-
-	void print_analysis() {
-		print_fanout();
-		print_bit_domains();
-	}
-};
-
-struct CxxrtlWorker {
-	// Options for prepare
-	bool run_hierarchy = false;
-	bool run_flatten = false;
-	bool run_proc = false;
-	// Options for analyze
-	bool print_analysis = false;
-
-	dict<const Module*, CxxrtlModWorker> mod_workers;
-
-	void prepare_design(Design *design)
-	{
-		for (auto module : design->modules()) {
-			if (module->get_blackbox_attribute())
-				continue;
-			if (!design->selected_module(module))
-				continue;
-			if (!design->selected_whole_module(module))
-				log_cmd_error("Can't handle partially selected module `%s'!\n", id2cstr(module->name));
-		}
-
-		log_push();
-		if (run_hierarchy)
-			Pass::call(design, "hierarchy -auto-top");
-		if (run_flatten)
-			Pass::call(design, "flatten");
-		if (run_proc)
-			Pass::call(design, "proc");
-		log_pop();
-	}
-
-	void analyze_design(Design *design)
-	{
-		for (auto module : design->modules()) {
-			if (!design->selected_module(module))
-				continue;
-
-			CxxrtlModWorker &mod_worker = mod_workers[module];
-			mod_worker.set(module);
-			mod_worker.analyze();
-			if (print_analysis)
-				mod_worker.print_analysis();
-		}
-	}
-};
-
-struct Cxxrtl2Backend : public Backend {
-	Cxxrtl2Backend() : Backend("cxxrtl2", "convert design to C++ RTL simulation") { }
-	void help() override
-	{
-		//   |---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|---v---|
-		log("\n");
-		log("    write_cxxrtl2 [options] [filename]\n");
-		log("\n");
-	}
-
-	void execute(std::ostream *&f, std::string filename, std::vector<std::string> args, Design *design) override
-	{
-		bool nohierarchy = false;
-		bool noflatten = false;
-		bool noproc = false;
-		bool print_analysis = false;
-		CxxrtlWorker worker;
-
-		log_header(design, "Executing CXXRTL2 backend.\n");
-
-		size_t argidx;
-		for (argidx = 1; argidx < args.size(); argidx++)
-		{
-			if (args[argidx] == "-nohierarchy") {
-				nohierarchy = true;
-				continue;
-			}
-			if (args[argidx] == "-noflatten") {
-				noflatten = true;
-				continue;
-			}
-			if (args[argidx] == "-noproc") {
-				noproc = true;
-				continue;
-			}
-			if (args[argidx] == "-print-analysis") {
-				print_analysis = true;
-				continue;
-			}
-			break;
-		}
-		extra_args(f, filename, args, argidx);
-
-		worker.run_hierarchy = !nohierarchy;
-		worker.run_flatten = !noflatten;
-		worker.run_proc = !noproc;
-		worker.print_analysis = print_analysis;
-
-		worker.prepare_design(design);
-		worker.analyze_design(design);
-	}
-} Cxxrtl2Backend;
-
-PRIVATE_NAMESPACE_END
-
+#endif
 
 /*
 struct RtlWorkItem {
@@ -531,4 +818,69 @@ struct RtlWorkItem {
 struct RtlWorkGroup {
 
 };
+*/
+
+/*
+
+	dict<Cell*, Cell*> cell_mffcs; // cell -> cell whose MFFC it is in
+
+	void set(Module *module)
+	{
+		this->module = module;
+		walker = new ModWalker(module->design, module);
+		sigmap = &walker->sigmap;
+	}
+
+	void analyze_fanout()
+	{
+		log_debug("Computing maximum fanout free cones.\n");
+		pool<Cell*> worklist;
+		for (auto cell : module->cells())
+			if (is_pure_cell(cell->type)) {
+				cell_mffcs[cell] = cell;
+				worklist.insert(cell);
+			}
+		while (!worklist.empty()) {
+			Cell *cell = worklist.pop();
+			pool<ModWalker::PortBit> drivers;
+			for (auto conn : cell->connections())
+				if (cell->input(conn.first))
+					walker->get_drivers(drivers, conn.second);
+			for (auto driver : drivers) {
+				if (!cell_mffcs.count(driver.cell) || cell_mffcs[driver.cell] == cell_mffcs[cell])
+					continue;
+				pool<Cell *> consumers_for_driver;
+				for (auto conn : driver.cell->connections())
+					if (cell->output(conn.first)) {
+						pool<ModWalker::PortBit> consumers;
+						walker->get_consumers(consumers, conn.second);
+						for (auto consumer : consumers)
+							consumers_for_driver.insert(consumer.cell);
+					}
+				bool all_consumers_in_mffc = true;
+				for (auto consumer : consumers_for_driver)
+					if (cell_mffcs.count(consumer) && cell_mffcs[consumer] != cell_mffcs[cell])
+						all_consumers_in_mffc = false;
+				if (all_consumers_in_mffc) {
+					log_debug("MFFC of %s is now %s\n", log_id(driver.cell), log_id(cell_mffcs[cell]));
+					cell_mffcs[driver.cell] = cell_mffcs[cell];
+					worklist.insert(driver.cell);
+				}
+			}
+		}
+	}
+
+	void print_fanout()
+	{
+		log("Printing maximum fanout free cones.\n");
+		dict<Cell*, pool<Cell*>> mffcs;
+		for (auto cell_mffc : cell_mffcs)
+			mffcs[cell_mffc.second].insert(cell_mffc.first);
+		for (auto mffc : mffcs) {
+			log("Cell %s\n", log_id(mffc.first));
+			for (auto node : mffc.second)
+				log("\t%s\n", log_id(node));
+		}
+	}
+
 */
