@@ -420,15 +420,13 @@ struct CxxrtlModWorker {
 	void print_event_domains() 
 	{
 		log("Printing event domains.\n\n");
-		dict<int, std::tuple<dict<Wire*, SigSpec>, pool<Cell*>, pool<IdString>>> domains;
+		dict<int, std::tuple<dict<Wire*, SigSpec>, pool<IdString>>> domains;
 		for (auto bit_domain : bit_triggers) {
 			log_assert(bit_domain.first.wire != nullptr);
 			get<0>(domains[bit_domain.second])[bit_domain.first.wire].append(bit_domain.first);
 		}
-		for (auto cell_domain : cell_triggers)
-			get<1>(domains[cell_domain.second]).insert(cell_domain.first);
 		for (auto it : memory_triggers)
-			get<2>(domains[it.second]).insert(it.first);
+			get<1>(domains[it.second]).insert(it.first);
 		domains.sort();
 		for (auto domain : domains) { // iterates in reverse order, so we reverse again
 			log("Domain %d @(", domain.first);
@@ -451,10 +449,9 @@ struct CxxrtlModWorker {
 				wire_spec.second.sort_and_unify();
 				log("\twire %s\n", log_signal(wire_spec.second));
 			}
-			get<1>(domain.second).sort<IdString::compare_ptr_by_name<Cell>>();
-			for (auto cell : get<1>(domain.second))
+			for (auto cell : trigger_sets[domain.first].second)
 				log("\tcell %s\n", log_id(cell));
-			for (auto mem : get<2>(domain.second))
+			for (auto mem : get<1>(domain.second))
 				log("\tmemory %s\n", log_id(mem));
 		}
 	}
@@ -471,6 +468,7 @@ struct CxxrtlModWorker {
 
 	void write(CxxrtlWriter &writer)
 	{
+		(void)writer;
 		// TODO
 	}
 };
@@ -525,6 +523,7 @@ struct CxxrtlWorker {
 	void write_design(std::ostream *&f, std::string filename)
 	{
 		// TODO: handle split files, etc
+		(void)filename;
 
 		CxxrtlWriter writer;
 		writer.begin(*f);
