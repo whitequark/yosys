@@ -242,20 +242,36 @@ struct TriggerSet {
 			bits[it.first] |= it.second;
 		return *this;
 	}
+
+	size_t size() const {
+		size_t res = 0;
+		for (auto it : bits) {
+			if (it.second == Polarity::Both) {
+				res += 2;
+			} else {
+				res += 1;
+			}
+		}
+		return res;
+	}
 };
 
+struct Domain {
+	TriggerSet triggers;
+	vector<Cell *> cells;
+	pool<SigBit> bits;
+	pool<IdString> memories;
+
+	Domain(const TriggerSet &triggers) : triggers(triggers) {}
+};
 
 struct CxxrtlModWorker {
 	Module *module = nullptr;
 	ModWalker *walker;
 	SigMap *sigmap;
 
-	dict<SigBit, int> bit_triggers;
-	dict<Cell*, int> cell_triggers;
-	dict<IdString, int> memory_triggers;
-
-	dict<TriggerSet, int> trigger_sets_dict;
-	vector<std::pair<TriggerSet, vector<Cell*>>> trigger_sets;
+	vector<Domain> domains;
+	dict<TriggerSet, int> domains_dict;
 
 	CxxrtlModWorker(Module *module) : module(module)
 	{
@@ -264,12 +280,12 @@ struct CxxrtlModWorker {
 	}
 
 	int get_trigger_set(const TriggerSet &triggers)	{
-		if (trigger_sets_dict.count(triggers)) {
-			return trigger_sets_dict[triggers];
+		if (domains_dict.count(triggers)) {
+			return domains_dict[triggers];
 		} else {
-			int res = trigger_sets.size();
-			trigger_sets.push_back({triggers, {}});
-			trigger_sets_dict[triggers] = res;
+			int res = domains.size();
+			domains.push_back(Domain(triggers));
+			domains_dict[triggers] = res;
 			return res;
 		}
 	}
@@ -306,6 +322,10 @@ struct CxxrtlModWorker {
 		vector<Mem> memories = Mem::get_all_memories(module);
 		dict<Cell*, Mem*> rport_to_mem;
 
+		dict<SigBit, int> bit_triggers;
+		dict<Cell*, int> cell_triggers;
+		dict<IdString, int> memory_triggers;
+
 		TopoSort<Cell*> topo;
 		for (auto cell : module->cells()) {
 			if (is_pure_cell(cell->type) || (cell->type.in(ID($memrd), ID($memrd_v2)) && !cell->getParam(ID::CLK_ENABLE).as_bool())) {
@@ -335,8 +355,9 @@ struct CxxrtlModWorker {
 					cell_triggers[rport.cell] = tset;
 					for (auto bit: walker->sigmap(rport.data)) {
 						bit_triggers[bit] = tset;
+						domains[tset].bits.insert(bit);
 					}
-					trigger_sets[tset].second.push_back(rport.cell);
+					domains[tset].cells.push_back(rport.cell);
 				}
 			}
 			TriggerSet mem_triggers;
@@ -347,9 +368,11 @@ struct CxxrtlModWorker {
 				mem_triggers |= triggers;
 				int tset = get_trigger_set(triggers);
 				cell_triggers[wport.cell] = tset;
-				trigger_sets[tset].second.push_back(wport.cell);
+				domains[tset].cells.push_back(wport.cell);
 			}
-			memory_triggers[mem.memid] = get_trigger_set(mem_triggers);
+			int tset = get_trigger_set(mem_triggers);
+			memory_triggers[mem.memid] = tset;
+			domains[tset].memories.insert(mem.memid);
 		}
 
 		for (auto cell: module->cells()) {
@@ -358,8 +381,9 @@ struct CxxrtlModWorker {
 				cell_triggers[cell] = tset;
 				for (auto bit: walker->sigmap(cell->getPort(ID::Q))) {
 					bit_triggers[bit] = tset;
+					domains[tset].bits.insert(bit);
 				}
-				trigger_sets[tset].second.push_back(cell);
+				domains[tset].cells.push_back(cell);
 			}
 		}
 
@@ -384,18 +408,18 @@ struct CxxrtlModWorker {
 								int tset = bit_triggers[bit];
 								if (found_trigger || (found_tset && inputs_tset != tset)) {
 									if (found_tset) {
-										triggers = trigger_sets[inputs_tset].first;
+										triggers = domains[inputs_tset].triggers;
 										found_tset = false;
 									}
 									found_trigger = true;
-									triggers |= trigger_sets[tset].first;
+									triggers |= domains[tset].triggers;
 								} else {
 									found_tset = true;
 									inputs_tset = tset;
 								}
 							} else {
 								if (found_tset) {
-									triggers = trigger_sets[inputs_tset].first;
+									triggers = domains[inputs_tset].triggers;
 									found_tset = false;
 								}
 								found_trigger = true;
@@ -411,27 +435,29 @@ struct CxxrtlModWorker {
 							if (!bit.wire)
 								continue;
 							bit_triggers[bit] = inputs_tset;
+							domains[inputs_tset].bits.insert(bit);
 						}
-				trigger_sets[inputs_tset].second.push_back(cell);
+				domains[inputs_tset].cells.push_back(cell);
 			}
 		}
+
+		// This dict is invalidated once the domain list is sorted.
+		domains_dict.clear();
+
+		// Sort the domain list by trigger set size, as a proxy for the subset-of partial ordering.
+		std::sort(domains.begin(), domains.end(), [](const Domain &a, const Domain &b) {
+			return a.triggers.size() < b.triggers.size();
+		});
 	}
 
 	void print_event_domains() 
 	{
 		log("Printing event domains.\n\n");
-		dict<int, std::tuple<dict<Wire*, SigSpec>, pool<IdString>>> domains;
-		for (auto bit_domain : bit_triggers) {
-			log_assert(bit_domain.first.wire != nullptr);
-			get<0>(domains[bit_domain.second])[bit_domain.first.wire].append(bit_domain.first);
-		}
-		for (auto it : memory_triggers)
-			get<1>(domains[it.second]).insert(it.first);
-		domains.sort();
-		for (auto domain : domains) { // iterates in reverse order, so we reverse again
-			log("Domain %d @(", domain.first);
+		int i = 0;
+		for (auto &domain : domains) {
+			log("Domain %d @(", i++);
 			bool first = true;
-			for (auto it: trigger_sets[domain.first].first.chunks()) {
+			for (auto it: domain.triggers.chunks()) {
 				if (first)
 					first = false;
 				else
@@ -444,14 +470,21 @@ struct CxxrtlModWorker {
 				log("%s%s", edge, log_signal(it.first));
 			}
 			log(")\n");
-			get<0>(domain.second).sort<IdString::compare_ptr_by_name<Wire>>();
-			for (auto wire_spec : get<0>(domain.second)) {
+
+			dict<Wire *, SigSpec> wire_bits;
+			for (auto bit : domain.bits) {
+				log_assert(bit.wire != nullptr);
+				wire_bits[bit.wire].append(bit);
+			}
+
+			wire_bits.sort<IdString::compare_ptr_by_name<Wire>>();
+			for (auto wire_spec : wire_bits) {
 				wire_spec.second.sort_and_unify();
 				log("\twire %s\n", log_signal(wire_spec.second));
 			}
-			for (auto cell : trigger_sets[domain.first].second)
+			for (auto cell : domain.cells)
 				log("\tcell %s\n", log_id(cell));
-			for (auto mem : get<1>(domain.second))
+			for (auto mem : domain.memories)
 				log("\tmemory %s\n", log_id(mem));
 		}
 	}
