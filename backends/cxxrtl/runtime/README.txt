@@ -14,5 +14,8 @@ file of the simulation toplevel).
 
 The interfaces declared in `cxxrtl*.h` (without `capi`) are unstable and may change without notice.
 
-For clarity, all of the files in this directory and its subdirectories have unique names regardless
-of the directory where they are placed.
+For clarity, all of the `cxxrtl*` files in this directory and its subdirectories have unique names
+regardless of the directory where they are placed.
+
+Files without `cxxrtl` in the name are vendored third party libraries. Refer to the individual files
+for their origin and copyright.
